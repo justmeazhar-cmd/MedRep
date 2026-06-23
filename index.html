@@ -197,7 +197,10 @@
     // MAIN APP
     // ==========================================
     function App() {
+      const [aiProvider, setAiProvider] = useState(() => localStorage.getItem('medrep_ai_provider') || 'gemini');
       const [apiKey, setApiKey] = useState(() => localStorage.getItem('medrep_gemini_apikey') || '');
+      const [deepseekKey, setDeepseekKey] = useState(() => localStorage.getItem('medrep_deepseek_apikey') || '');
+      const [openaiKey, setOpenaiKey] = useState(() => localStorage.getItem('medrep_openai_apikey') || '');
       const [showApiKey, setShowApiKey] = useState(false);
       const [apiConnected, setApiConnected] = useState('NOT_CONNECTED');
 
@@ -504,18 +507,43 @@
           `Document: ${doc.name}\n` + doc.pages.map(p => `[Page ${p.pageNumber}]\n${p.content}`).join('\n')
         ).join('\n\n');
 
-        if (apiConnected === 'CONNECTED' && apiKey) {
+        const activeKey = aiProvider === 'gemini' ? apiKey : aiProvider === 'deepseek' ? deepseekKey : openaiKey;
+        if (apiConnected === 'CONNECTED' && activeKey) {
           try {
             const systemPrompt = `You are "MedRep Assistant", a medical communication and patient education AI tool. Explain based only on provided documents. Never diagnose or prescribe.`;
-            const modelName = 'gemini-2.0-flash';
-            const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: systemPrompt + '\n\n---\n\n' + contextBody + '\n\nUSER QUESTION:\n' + userMessage }] }] })
-            });
-            const data = await response.json();
-            if (!response.ok) throw new Error(data.error?.message || 'HTTP ' + response.status);
-            const generatedText = data.candidates?.[0]?.content?.parts?.[0]?.text || "No response received.";
+            let generatedText = '';
+            
+            if (aiProvider === 'gemini') {
+              const modelName = 'gemini-2.0-flash';
+              const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${activeKey}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: systemPrompt + '\n\n---\n\n' + contextBody + '\n\nUSER QUESTION:\n' + userMessage }] }] })
+              });
+              const data = await response.json();
+              if (!response.ok) throw new Error(data.error?.message || 'HTTP ' + response.status);
+              generatedText = data.candidates?.[0]?.content?.parts?.[0]?.text || "No response received.";
+            } else {
+              // OpenAI-compatible APIs (DeepSeek / ChatGPT)
+              const isDeepSeek = aiProvider === 'deepseek';
+              const apiUrl = isDeepSeek ? 'https://api.deepseek.com/chat/completions' : 'https://api.openai.com/v1/chat/completions';
+              const model = isDeepSeek ? 'deepseek-chat' : 'gpt-4o-mini';
+              const response = await fetch(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + activeKey },
+                body: JSON.stringify({
+                  model: model,
+                  messages: [
+                    { role: 'system', content: systemPrompt },
+                    { role: 'user', content: 'Documents:\n' + contextBody + '\n\nQuestion: ' + userMessage }
+                  ],
+                  max_tokens: 2048
+                })
+              });
+              const data = await response.json();
+              if (!response.ok) throw new Error(data.error?.message || 'HTTP ' + response.status);
+              generatedText = data.choices?.[0]?.message?.content || "No response received.";
+            }
             const matchedCitations = [];
             documents.forEach(doc => {
               doc.pages.forEach(p => {
@@ -525,14 +553,15 @@
             });
             setChatMessages(prev => [...prev, {
               sender: 'ai', text: generatedText,
-              explanation: "Response from Gemini 2.0 Flash based on your documents.",
+              explanation: `Response from ${aiProvider === 'gemini' ? 'Gemini 2.0 Flash' : aiProvider === 'deepseek' ? 'DeepSeek Chat' : 'ChatGPT (GPT-4o Mini)'} based on your documents.`,
               evidence: matchedCitations.length > 0 ? matchedCitations : [{ docName: documents[0]?.name || "Document", page: 1, text: "Reference" }],
               terms: []
             }]);
             generateSuggestedQuestions(generatedText);
           } catch(error) {
-            console.error("Gemini API Error:", error);
-            triggerNotification("Gemini API error: " + error.message, "error");
+            console.error("AI API Error:", error);
+            const providerNames = { gemini: 'Gemini', deepseek: 'DeepSeek', chatgpt: 'ChatGPT' };
+            triggerNotification(`${providerNames[aiProvider] || 'AI'} API error: ` + error.message, "error");
             executePresetFallback(userMessage);
           }
         } else {
@@ -551,17 +580,16 @@
           setChatMessages(prev => [...prev, { sender: 'ai', text: bestMatch.answer, explanation: bestMatch.simpleExplanation, evidence: bestMatch.evidence, terms: bestMatch.terms }]);
           generateSuggestedQuestions(bestMatch.answer);
         } else {
-          let extractedLines = [];
-          documents.forEach(doc => doc.pages.forEach(p => {
-            p.content.split('\n').forEach(line => {
-              if (line.toLowerCase().includes('high') || line.toLowerCase().includes('low') || line.toLowerCase().includes('critical'))
-                extractedLines.push({ docName: doc.name, page: p.pageNumber, text: line.replace('- ', '') });
-            });
-          }));
-          const text = extractedLines.length > 0
-            ? "I found these notable indicators:\n\n" + extractedLines.map(el => `* **${el.text}** (${el.docName} Pg ${el.page})`).join('\n') + "\n\nAsk me to explain any of these."
-            : "I couldn't find matching data. Ask about 'glucose', 'cholesterol', or 'MRI'.";
-          setChatMessages(prev => [...prev, { sender: 'ai', text, explanation: "Searching through records...", evidence: extractedLines.length > 0 ? [extractedLines[0]] : [], terms: [] }]);
+          // Summarize the document content instead of dumping raw lines
+          const docSummary = documents.map(doc => {
+            const pageCount = doc.pagesCount;
+            const textLen = doc.pages.reduce((sum, p) => sum + p.content.length, 0);
+            const hasImage = doc.pages.some(p => p.imageUrl);
+            return `**${doc.name}** — ${pageCount} page(s), ${(textLen/1000).toFixed(1)}KB text${hasImage ? ' (includes scanned pages)' : ''}`;
+          }).join('\n');
+
+          const text = `I'm currently unable to connect to the Gemini AI service. The app is running in **offline mode**.\n\n**Your uploaded documents:**\n${docSummary}\n\n**To get AI-powered answers:**\n1. Check that your Gemini API Key is valid and has quota available\n2. Get a free key at https://aistudio.google.com/apikey\n3. Paste it in the sidebar and click **Connect**\n\n*In the meantime, you can ask about: glucose, cholesterol, MRI — I have preset information for those topics.*`;
+          setChatMessages(prev => [...prev, { sender: 'ai', text, explanation: "The AI service is unavailable. Check your API key or quota.", evidence: [], terms: [{ name: "API Quota", definition: "Google's free Gemini API has limited requests per minute. Wait 60 seconds or get a new key." }] }]);
         }
       };
 
@@ -639,24 +667,30 @@
             {/* LEFT SIDEBAR */}
             <aside className={`w-full lg:w-[20%] flex-shrink-0 flex flex-col border-r overflow-y-auto ${darkMode ? 'bg-slate-950 border-slate-800' : 'bg-slate-100 border-slate-200'} p-3 sm:p-4 space-y-4`}>
               
-              {/* Gemini API Config */}
+              {/* AI Provider Config */}
               <div className={`p-3 rounded-xl border ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'} animate-fade-in`}>
                 <div className="flex items-center justify-between mb-2">
-                  <span className="text-[10px] sm:text-xs font-bold tracking-wider uppercase text-slate-400">Gemini 2.0 Flash</span>
+                  <span className="text-[10px] sm:text-xs font-bold tracking-wider uppercase text-slate-400">AI Provider</span>
                   <div className="flex items-center gap-1.5">
                     <span className={`w-2 h-2 rounded-full ${apiConnected === 'CONNECTED' ? 'bg-emerald-500' : apiConnected === 'CONNECTING' ? 'bg-yellow-500 animate-ping' : 'bg-red-500'}`} />
                     <span className="text-[9px] sm:text-[10px] font-semibold text-slate-400">{apiConnected === 'CONNECTED' ? 'Connected' : apiConnected === 'CONNECTING' ? 'Connecting...' : 'Offline'}</span>
                   </div>
                 </div>
+                {/* Provider selector */}
+                <div className="flex mb-2 bg-slate-100 dark:bg-slate-800 rounded-lg p-0.5 border dark:border-slate-700">
+                  {['gemini','deepseek','chatgpt'].map(p => (
+                    <button key={p} onClick={() => { setAiProvider(p); setApiConnected('NOT_CONNECTED'); localStorage.setItem('medrep_ai_provider', p); }} className={`flex-1 text-[8px] sm:text-[10px] font-semibold py-1.5 rounded-md transition ${aiProvider === p ? 'bg-white dark:bg-slate-700 shadow-sm text-blue-600' : 'text-slate-500 hover:text-slate-700'}`}>{p === 'chatgpt' ? 'ChatGPT' : p.charAt(0).toUpperCase() + p.slice(1)}</button>
+                  ))}
+                </div>
                 <div className="space-y-2">
                   <div className="relative">
-                    <input type={showApiKey ? 'text' : 'password'} placeholder="Enter Gemini API Key" value={apiKey} onChange={(e) => setApiKey(e.target.value)} className={`w-full text-[10px] sm:text-xs px-2.5 py-1.5 rounded-lg border focus:ring-1 focus:ring-blue-500 outline-none ${darkMode ? 'bg-slate-800 border-slate-700 text-white' : 'bg-slate-50 border-slate-200 text-slate-800'}`} />
+                    <input type={showApiKey ? 'text' : 'password'} placeholder={aiProvider === 'gemini' ? 'Enter Gemini API Key' : aiProvider === 'deepseek' ? 'Enter DeepSeek API Key' : 'Enter OpenAI API Key'} value={aiProvider === 'gemini' ? apiKey : aiProvider === 'deepseek' ? deepseekKey : openaiKey} onChange={(e) => { if (aiProvider === 'gemini') setApiKey(e.target.value); else if (aiProvider === 'deepseek') setDeepseekKey(e.target.value); else setOpenaiKey(e.target.value); }} className={`w-full text-[10px] sm:text-xs px-2.5 py-1.5 rounded-lg border focus:ring-1 focus:ring-blue-500 outline-none ${darkMode ? 'bg-slate-800 border-slate-700 text-white' : 'bg-slate-50 border-slate-200 text-slate-800'}`} />
                     <button onClick={() => setShowApiKey(!showApiKey)} className="absolute right-2 top-1.5 text-slate-400 hover:text-slate-600 text-[9px] sm:text-[10px] font-bold">{showApiKey ? 'Hide' : 'Show'}</button>
                   </div>
                   {apiConnected === 'CONNECTED' ? (
-                    <button onClick={() => { setApiKey(''); localStorage.removeItem('medrep_gemini_apikey'); setApiConnected('NOT_CONNECTED'); triggerNotification('Disconnected', 'info'); }} className="w-full bg-slate-200 hover:bg-slate-300 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-800 dark:text-white text-[10px] sm:text-xs font-semibold py-1.5 rounded-lg transition">Disconnect</button>
+                    <button onClick={() => { setApiKey(''); setDeepseekKey(''); setOpenaiKey(''); localStorage.removeItem('medrep_gemini_apikey'); localStorage.removeItem('medrep_deepseek_apikey'); localStorage.removeItem('medrep_openai_apikey'); setApiConnected('NOT_CONNECTED'); triggerNotification('Disconnected', 'info'); }} className="w-full bg-slate-200 hover:bg-slate-300 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-800 dark:text-white text-[10px] sm:text-xs font-semibold py-1.5 rounded-lg transition">Disconnect</button>
                   ) : (
-                    <button onClick={() => { if (!apiKey.trim()) { triggerNotification('Enter API Key', 'error'); return; } setApiConnected('CONNECTING'); setTimeout(() => { localStorage.setItem('medrep_gemini_apikey', apiKey); setApiConnected('CONNECTED'); triggerNotification('Gemini Connected!', 'success'); }, 800); }} disabled={apiConnected === 'CONNECTING'} className={`w-full text-white text-[10px] sm:text-xs font-semibold py-1.5 rounded-lg transition ${apiConnected === 'CONNECTING' ? 'bg-yellow-500 cursor-wait' : 'bg-blue-600 hover:bg-blue-700'}`}>{apiConnected === 'CONNECTING' ? 'Connecting...' : 'Connect'}</button>
+                    <button onClick={() => { const key = aiProvider === 'gemini' ? apiKey : aiProvider === 'deepseek' ? deepseekKey : openaiKey; if (!key.trim()) { triggerNotification('Enter API Key', 'error'); return; } setApiConnected('CONNECTING'); setTimeout(() => { const storageKey = aiProvider === 'gemini' ? 'medrep_gemini_apikey' : aiProvider === 'deepseek' ? 'medrep_deepseek_apikey' : 'medrep_openai_apikey'; localStorage.setItem(storageKey, key); setApiConnected('CONNECTED'); const names = { gemini: 'Gemini', deepseek: 'DeepSeek', chatgpt: 'ChatGPT' }; triggerNotification(names[aiProvider] + ' Connected!', 'success'); }, 800); }} disabled={apiConnected === 'CONNECTING'} className={`w-full text-white text-[10px] sm:text-xs font-semibold py-1.5 rounded-lg transition ${apiConnected === 'CONNECTING' ? 'bg-yellow-500 cursor-wait' : 'bg-blue-600 hover:bg-blue-700'}`}>{apiConnected === 'CONNECTING' ? 'Connecting...' : 'Connect'}</button>
                   )}
                 </div>
               </div>
@@ -989,11 +1023,11 @@
               <div className="p-3 sm:p-4 border-b flex items-center justify-between">
                 <div>
                   <h3 className="text-xs sm:text-sm font-bold text-blue-600">AI Assistant</h3>
-                  <p className="text-[9px] sm:text-[10px] text-slate-400 font-medium">Answers from your reports</p>
+                  <p className="text-[9px] sm:text-[10px] text-slate-400 font-medium">{apiConnected === 'CONNECTED' ? ({ gemini: 'Gemini 2.0 Flash', deepseek: 'DeepSeek Chat', chatgpt: 'GPT-4o Mini' }[aiProvider] || 'AI') : 'Answers from your reports'}</p>
                 </div>
                 <div className="flex items-center gap-1">
                   <span className={`w-1.5 h-1.5 rounded-full ${apiConnected === 'CONNECTED' ? 'bg-emerald-500' : 'bg-slate-300'}`} />
-                  <span className="text-[9px] text-slate-400">{apiConnected === 'CONNECTED' ? 'AI Online' : 'Offline'}</span>
+                  <span className="text-[9px] text-slate-400">{apiConnected === 'CONNECTED' ? ({ gemini: 'Gemini', deepseek: 'DeepSeek', chatgpt: 'ChatGPT' }[aiProvider] || 'AI') : 'Offline'}</span>
                 </div>
               </div>
               <div className="flex-1 overflow-y-auto p-3 sm:p-4 space-y-3 sm:space-y-4">
